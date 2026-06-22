@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import date, timedelta
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders, restocking_orders
 
@@ -130,9 +130,15 @@ class RestockingOrderItem(BaseModel):
     unit_price: float
     lead_time_days: int
 
+class RestockingOrderItemRequest(BaseModel):
+    # Clients submit only sku + quantity; price/name/lead-time are derived
+    # server-side from demand_forecasts to prevent price tampering.
+    sku: str
+    quantity: int = Field(gt=0)
+
 class CreateRestockingOrderRequest(BaseModel):
-    budget: float
-    items: List[RestockingOrderItem]
+    budget: float = Field(gt=0)
+    items: List[RestockingOrderItemRequest]
 
 class RestockingOrder(BaseModel):
     id: str
@@ -201,16 +207,43 @@ def create_restocking_order(request: CreateRestockingOrderRequest):
     if not request.items:
         raise HTTPException(status_code=400, detail="At least one item is required")
 
+    # Authoritative catalog lookup: never trust client-supplied prices or lead times.
+    forecast_by_sku = {f["item_sku"]: f for f in demand_forecasts}
+
+    line_items: List[RestockingOrderItem] = []
+    for req_item in request.items:
+        forecast = forecast_by_sku.get(req_item.sku)
+        if forecast is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown item SKU '{req_item.sku}'",
+            )
+        line_items.append(
+            RestockingOrderItem(
+                sku=req_item.sku,
+                name=forecast["item_name"],
+                quantity=req_item.quantity,
+                unit_price=forecast["unit_cost"],
+                lead_time_days=forecast["lead_time_days"],
+            )
+        )
+
+    total_value = round(sum(i.quantity * i.unit_price for i in line_items), 2)
+    if total_value > request.budget:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Order total {total_value} exceeds budget {request.budget}",
+        )
+
     order_id = str(len(restocking_orders) + 1)
     today = date.today()
     # Delivery is gated by the slowest line item
-    max_lead = max(item.lead_time_days for item in request.items)
-    total_value = round(sum(item.quantity * item.unit_price for item in request.items), 2)
+    max_lead = max(i.lead_time_days for i in line_items)
 
     order = RestockingOrder(
         id=order_id,
         order_number=f"RST-2025-{int(order_id):04d}",
-        items=request.items,
+        items=line_items,
         status="Submitted",
         order_date=today.isoformat(),
         expected_delivery=(today + timedelta(days=max_lead)).isoformat(),

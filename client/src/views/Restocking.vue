@@ -165,7 +165,9 @@ export default {
       error.value = null
       successMessage.value = null
       try {
-        const items = recommendations.value.map(({ trend, ...i }) => i)
+        // Send only sku + quantity; the server derives price/name/lead-time
+        // from its own forecast catalog to prevent client-side tampering.
+        const items = recommendations.value.map(r => ({ sku: r.sku, quantity: r.quantity }))
         const result = await api.createRestockingOrder({ budget: budget.value, items })
         successMessage.value = t('restocking.orderPlaced').replace('{orderNumber}', result.order_number)
       } catch (err) {

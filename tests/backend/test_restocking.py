@@ -18,26 +18,19 @@ def reset_restocking_orders():
 
 @pytest.fixture
 def sample_restocking_request():
-    """Sample restocking order request body."""
+    """Sample restocking order request body (sku + quantity only)."""
     return {
         "budget": 5000.0,
         "items": [
-            {
-                "sku": "WDG-001",
-                "name": "Industrial Widget Type A",
-                "quantity": 100,
-                "unit_price": 24.50,
-                "lead_time_days": 7,
-            },
-            {
-                "sku": "GSK-203",
-                "name": "High-Temperature Gasket",
-                "quantity": 200,
-                "unit_price": 6.25,
-                "lead_time_days": 4,
-            },
+            {"sku": "WDG-001", "quantity": 100},
+            {"sku": "GSK-203", "quantity": 200},
         ],
     }
+
+
+def _forecast_by_sku(client):
+    """Fetch the demand-forecast catalog keyed by SKU for server-side price lookups."""
+    return {f["item_sku"]: f for f in client.get("/api/demand").json()}
 
 
 class TestDemandForecastFields:
@@ -74,7 +67,7 @@ class TestRestockingOrdersEndpoints:
         assert len(data) == 0
 
     def test_create_restocking_order_success(self, client, sample_restocking_request):
-        """Test creating a restocking order returns 201 with computed fields."""
+        """Test creating a restocking order returns 201 with server-derived fields."""
         response = client.post("/api/restocking-orders", json=sample_restocking_request)
         assert response.status_code == 201
 
@@ -86,20 +79,24 @@ class TestRestockingOrdersEndpoints:
         assert order["budget"] == sample_restocking_request["budget"]
         assert len(order["items"]) == 2
 
+        # total_value must be computed from the server's forecast catalog,
+        # not from anything the client sent.
+        catalog = _forecast_by_sku(client)
         expected_total = sum(
-            i["quantity"] * i["unit_price"] for i in sample_restocking_request["items"]
+            i["quantity"] * catalog[i["sku"]]["unit_cost"]
+            for i in sample_restocking_request["items"]
         )
         assert abs(order["total_value"] - expected_total) < 0.01
 
     def test_expected_delivery_uses_max_lead_time(self, client):
-        """Test that expected_delivery = order_date + max(lead_time_days)."""
+        """Test that expected_delivery = order_date + max(lead_time_days from catalog)."""
+        catalog = _forecast_by_sku(client)
+        skus = ["GSK-203", "MTR-304", "WDG-001"]
+        expected_max_lead = max(catalog[s]["lead_time_days"] for s in skus)
+
         body = {
-            "budget": 10000.0,
-            "items": [
-                {"sku": "A", "name": "A", "quantity": 1, "unit_price": 1.0, "lead_time_days": 3},
-                {"sku": "B", "name": "B", "quantity": 1, "unit_price": 1.0, "lead_time_days": 14},
-                {"sku": "C", "name": "C", "quantity": 1, "unit_price": 1.0, "lead_time_days": 7},
-            ],
+            "budget": 100000.0,
+            "items": [{"sku": s, "quantity": 1} for s in skus],
         }
         response = client.post("/api/restocking-orders", json=body)
         assert response.status_code == 201
@@ -107,7 +104,7 @@ class TestRestockingOrdersEndpoints:
         order = response.json()
         order_date = date.fromisoformat(order["order_date"])
         expected_delivery = date.fromisoformat(order["expected_delivery"])
-        assert (expected_delivery - order_date).days == 14
+        assert (expected_delivery - order_date).days == expected_max_lead
 
     def test_create_empty_items_returns_400(self, client):
         """Test that an empty items list is rejected."""
@@ -119,6 +116,59 @@ class TestRestockingOrdersEndpoints:
         data = response.json()
         assert "detail" in data
         assert "item" in data["detail"].lower()
+
+    def test_unknown_sku_returns_400(self, client):
+        """Test that an SKU not present in the forecast catalog is rejected."""
+        response = client.post(
+            "/api/restocking-orders",
+            json={"budget": 1000.0, "items": [{"sku": "NOPE-999", "quantity": 1}]},
+        )
+        assert response.status_code == 400
+
+        data = response.json()
+        assert "detail" in data
+        assert "nope-999" in data["detail"].lower()
+
+    def test_non_positive_quantity_returns_422(self, client):
+        """Test that quantity <= 0 fails request validation."""
+        for qty in (0, -5):
+            response = client.post(
+                "/api/restocking-orders",
+                json={"budget": 1000.0, "items": [{"sku": "WDG-001", "quantity": qty}]},
+            )
+            assert response.status_code == 422
+
+    def test_total_exceeds_budget_returns_400(self, client):
+        """Test that the server enforces total_value <= budget."""
+        catalog = _forecast_by_sku(client)
+        sku = "WDG-001"
+        unit_cost = catalog[sku]["unit_cost"]
+        # Request 10 units but provide budget for only ~1
+        response = client.post(
+            "/api/restocking-orders",
+            json={"budget": unit_cost, "items": [{"sku": sku, "quantity": 10}]},
+        )
+        assert response.status_code == 400
+
+        data = response.json()
+        assert "detail" in data
+        assert "budget" in data["detail"].lower()
+
+    def test_client_supplied_price_is_ignored(self, client):
+        """Test that unit_price in the request body is ignored in favour of catalog."""
+        catalog = _forecast_by_sku(client)
+        response = client.post(
+            "/api/restocking-orders",
+            json={
+                "budget": 100000.0,
+                "items": [{"sku": "WDG-001", "quantity": 1, "unit_price": 0.01}],
+            },
+        )
+        assert response.status_code == 201
+
+        order = response.json()
+        assert abs(order["items"][0]["unit_price"] - catalog["WDG-001"]["unit_cost"]) < 0.01
+        assert abs(order["total_value"] - catalog["WDG-001"]["unit_cost"]) < 0.01
 
     def test_created_order_appears_in_list(self, client, sample_restocking_request):
         """Test that a created order is returned by the list endpoint."""
