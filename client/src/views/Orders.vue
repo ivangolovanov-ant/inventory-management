@@ -74,6 +74,55 @@
           </table>
         </div>
       </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h3 class="card-title">{{ t('orders.submittedOrders') }} ({{ restockingOrders.length }})</h3>
+        </div>
+        <p v-if="!restockingOrders.length" class="empty-state">{{ t('orders.noSubmittedOrders') }}</p>
+        <div v-else class="table-container">
+          <table class="orders-table">
+            <thead>
+              <tr>
+                <th class="col-order-number">{{ t('orders.table.orderNumber') }}</th>
+                <th class="col-items">{{ t('orders.table.items') }}</th>
+                <th class="col-date">{{ t('orders.table.orderDate') }}</th>
+                <th class="col-date">{{ t('orders.table.expectedDelivery') }}</th>
+                <th class="col-lead-time">{{ t('orders.table.leadTime') }}</th>
+                <th class="col-value">{{ t('orders.table.totalValue') }}</th>
+                <th class="col-status">{{ t('orders.table.status') }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="order in restockingOrders" :key="order.id">
+                <td class="col-order-number"><strong>{{ order.order_number }}</strong></td>
+                <td class="col-items">
+                  <details class="items-details">
+                    <summary class="items-summary">
+                      {{ t('orders.itemsCount', { count: order.items.length }) }}
+                    </summary>
+                    <div class="items-dropdown">
+                      <div v-for="item in order.items" :key="item.sku" class="item-entry">
+                        <span class="item-name">{{ item.name }}</span>
+                        <span class="item-meta">x {{ item.quantity }}</span>
+                      </div>
+                    </div>
+                  </details>
+                </td>
+                <td class="col-date">{{ formatDate(order.order_date) }}</td>
+                <td class="col-date">{{ formatDate(order.expected_delivery) }}</td>
+                <td class="col-lead-time">{{ getMaxLeadTime(order) }} days</td>
+                <td class="col-value"><strong>{{ currencySymbol }}{{ order.total_value.toLocaleString() }}</strong></td>
+                <td class="col-status">
+                  <span :class="['badge', getOrderStatusClass(order.status)]">
+                    {{ t(`status.${order.status.toLowerCase()}`) }}
+                  </span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -95,6 +144,7 @@ export default {
     const loading = ref(true)
     const error = ref(null)
     const orders = ref([])
+    const restockingOrders = ref([])
 
     // Use shared filters
     const {
@@ -109,7 +159,10 @@ export default {
       try {
         loading.value = true
         const filters = getCurrentFilters()
-        const fetchedOrders = await api.getOrders(filters)
+        const [fetchedOrders, fetchedRestockingOrders] = await Promise.all([
+          api.getOrders(filters),
+          api.getRestockingOrders()
+        ])
 
         // Sort orders by order_date (earliest first)
         orders.value = fetchedOrders.sort((a, b) => {
@@ -117,6 +170,7 @@ export default {
           const dateB = new Date(b.order_date)
           return dateA - dateB
         })
+        restockingOrders.value = fetchedRestockingOrders
       } catch (err) {
         error.value = 'Failed to load orders: ' + err.message
       } finally {
@@ -138,9 +192,15 @@ export default {
         'Delivered': 'success',
         'Shipped': 'info',
         'Processing': 'warning',
-        'Backordered': 'danger'
+        'Backordered': 'danger',
+        'Submitted': 'info'
       }
       return statusMap[status] || 'info'
+    }
+
+    const getMaxLeadTime = (order) => {
+      if (!order.items || !order.items.length) return 0
+      return Math.max(...order.items.map(i => i.lead_time_days))
     }
 
     const formatDate = (dateString) => {
@@ -160,8 +220,10 @@ export default {
       loading,
       error,
       orders,
+      restockingOrders,
       getOrdersByStatus,
       getOrderStatusClass,
+      getMaxLeadTime,
       formatDate,
       currencySymbol,
       translateProductName,
@@ -275,5 +337,16 @@ export default {
 .item-meta {
   font-size: 0.813rem;
   color: #64748b;
+}
+
+.col-lead-time {
+  width: 110px;
+}
+
+.empty-state {
+  color: #64748b;
+  font-size: 0.938rem;
+  padding: 1.25rem 0;
+  text-align: center;
 }
 </style>
